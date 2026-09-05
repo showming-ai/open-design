@@ -217,14 +217,27 @@ it is a non-empty string, otherwise uses its own `DSH_PROFILE_*` code:
 | frame direction | host-to-child: stdin lines; child-to-host: stdout lines only; stderr is for human diagnostics |
 | process-exit fallback | 1 s after managed exit; the host keeps a ~3 s cancellation grace |
 
-## 9. Open questions
+## 9. Resolved decisions (baseline, adopted 2026-09-05)
 
-1. Host forward compatibility: the current host parse is strict; confirm the
-   strict-vs-tolerant boundary explicitly.
-2. `models` catalog `provider` and `model` ids are namespaced by Harness
-   providers; Open Design must not assume a fixed catalog and should query it
-   at runtime.
-3. Single-execute-per-process plus the 1 s exit fallback interplay with very
-   long tail output; verify no truncation window.
-4. Windows: child spawn and probe timing differences must be covered in the
-   compatibility matrix.
+1. **Host forward compatibility.** The host MUST ignore unknown frame types
+   and unknown optional fields, and validate only known required fields
+   strictly. This mirrors the child's behavior of dropping unknown
+   host-command fields, so both directions tolerate additive evolution within
+   a wire version. (Implementation note: the current host adapter in
+   `apps/daemon/src/agent-protocol/dsh-profile/` is strict; aligning it with
+   this rule is tracked as a host-side change.)
+2. **Model catalog is a runtime query result.** A host MUST query the catalog
+   (`--models` or equivalent) per run and MUST NOT assume a fixed provider or
+   model set, nor that a catalogued model still exists at execute time.
+   Selection references catalogued ids and fails cleanly when a referenced id
+   is absent.
+3. **Tail-output truncation (open verification).** Recorded as a known risk
+   pending verification. Before any protocol change, run a large-output test
+   (output that continues past the ~1 s exit-fallback window) to verify no
+   truncation; only if truncation is reproduced, add a drain/acknowledgement
+   mechanism in a later wire version.
+4. **Platform grading in the compatibility matrix.** macOS and Linux are the
+   formally supported replay platforms; Windows native is best-effort. A
+   Windows-only failure must block only Windows-specific correctness and must
+   never be reported as protocol drift. The matrix records the platform next
+   to each Harness x runtime version pair.
