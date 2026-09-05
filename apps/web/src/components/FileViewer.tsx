@@ -12509,12 +12509,18 @@ function HtmlViewer({
         && data.type !== 'od-edit-text-session'
       ) return;
       if (data.type === 'od-edit-targets' && Array.isArray(data.targets)) {
-        setManualEditTargets(data.targets);
+        const seen = new Set<string>();
+        const unique = data.targets.filter((t) => {
+          if (seen.has(t.id)) return false;
+          seen.add(t.id);
+          return true;
+        });
+        setManualEditTargets(unique);
         // Target broadcasts can be briefly empty while the iframe/save path is
         // settling; keep the user's inspector selection unless a fresh copy is
         // available to update its metadata.
         setSelectedManualEditTarget((current) =>
-          current ? data.targets.find((target) => target.id === current.id) ?? current : current,
+          current ? unique.find((target) => target.id === current.id) ?? current : current,
         );
         const selectedId = selectedManualEditTargetIdRef.current;
         if (selectedId) setTimeout(() => postSelectedManualEditTargetToIframe(selectedId), 0);
