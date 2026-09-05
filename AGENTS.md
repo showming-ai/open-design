@@ -2,6 +2,20 @@
 
 This file is the single source of truth for agents entering this repository. Read this file first; after entering `apps/`, `packages/`, `tools/`, or `e2e/`, read that layer's `AGENTS.md` for module-level details. Do not copy module details back into the root file; root stays focused on cross-repository boundaries, workflow, and commands.
 
+## ⚠️ Machine-local workflow note (this checkout only — do NOT merge upstream)
+
+This checkout is a customized fork layout, not the plain upstream clone:
+
+- `origin` = upstream `nexu-io/open-design`; `showming` = personal fork `showming-ai/open-design` (owning account: `showming-ai` / `oowloowl@gmail.com`).
+- `main` must **always mirror `origin/main` exactly**. Never commit machine-local work to `main`; keep it clean for upstream tracking.
+- Machine-local changes live only on branch **`opendesign233`** (base = `origin/main`). Its first local commit is `21b38ecd9` — dedupes manual-edit targets in `apps/web/src/components/FileViewer.tsx` (upstream does not have it).
+- One-command sync SOP (upstream → `opendesign233` merge; keeps local `main` and fork `main` in sync):
+  `powershell -ExecutionPolicy Bypass -File C:\Tools\sync-opendesign233.ps1`
+  Details of the branch model live in that script's header comment.
+- When upstream `nexu-io/open-design` main advances: fetch `origin`, merge `origin/main` into `opendesign233` (resolve conflicts there), push `showming opendesign233`, then sync fork `main` to upstream (merge-upstream). Never merge `opendesign233` back into `main`.
+- Local git identity is set repo-locally to `showming-ai <oowloowl@gmail.com>`.
+- Do **not** include this note or other machine-local commits in any PR intended for upstream `nexu-io/open-design`.
+
 ## Core documentation index
 
 - Product and onboarding: `README.md`, `docs/i18n/README.zh-CN.md`, `QUICKSTART.md`.
