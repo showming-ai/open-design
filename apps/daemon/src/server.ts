@@ -587,6 +587,7 @@ import {
   deliverableSyntaxFinalizerEnabled,
   finalizeSuccessfulRunDeliverable,
 } from './artifacts/successful-run-deliverable-finalization.js';
+import { inferBaselineHtmlEntry } from './run-deliverable-validation.js';
 import { recordDeliverableSyntaxDelivery } from './artifacts/deliverable-syntax-metrics.js';
 import {
   POST_TOOL_RESUME_CONTINUATION_PROMPT,
@@ -11396,6 +11397,7 @@ export async function startServer({
     // for ANY agent (not just claude_code). Only for real project runs: a
     // null `cwd` means a no-project run rooted at PROJECT_ROOT, whose churn is
     // not the user's artifacts — those fall back to the tool-stream count.
+    let baselineEntryFile: string | undefined;
     if (run?.id && cwd) {
       try {
         const before = await snapshotProjectArtifactsAsync(cwd);
@@ -11404,6 +11406,7 @@ export async function startServer({
         // do not leave a stale baseline behind for a completed run.
         if (!run.artifactOutcome && !design.runs.isTerminal(run.status)) {
           runArtifactBaselines.remember(run.id, cwd, before);
+          baselineEntryFile = inferBaselineHtmlEntry(cwd, before.keys());
         }
       } catch {
         // Snapshotting is best-effort; finish falls back to the tool-stream count.
@@ -16560,6 +16563,7 @@ export async function startServer({
         }
         await resolveRunArtifactOutcomeBeforeFinishAsync();
         const deliverableFinalization = await finalizeSuccessfulRunDeliverable({
+          ...(run.artifactOutcome?.diff && baselineEntryFile ? { baselineEntryFile } : {}),
           projectsRoot: PROJECTS_DIR,
           projectId: run.projectId ?? null,
           projectMetadata: projectRecord?.metadata,
@@ -16577,9 +16581,41 @@ export async function startServer({
             : {}),
         });
         const { deliverable } = deliverableFinalization;
+        // Adding a second page must not erase an unambiguous pre-run entry.
+        // Retain only a verified baseline identity, without replacing a user's
+        // explicit selection or metadata changed while this Run was executing.
+        if (
+          deliverable.valid && deliverable.linkedPage
+          && deliverable.entryFile === baselineEntryFile
+          && run.artifactOutcome?.diff && run.projectId && cwd
+        ) {
+          try {
+            const current = getProject(db, run.projectId);
+            if (
+              current?.metadata?.kind === 'prototype'
+              && !current.metadata.entryFile
+              && resolveProjectDir(PROJECTS_DIR, current.id, current.metadata) === cwd
+            ) {
+              updateProject(db, current.id, {
+                metadata: { ...current.metadata, entryFile: deliverable.entryFile },
+                updatedAt: SYNC_KEEPS_UPDATED_AT,
+              });
+            }
+          } catch {
+            console.warn('[deliverable] could not retain verified prototype entry');
+          }
+        }
         if (strategyCompletionCandidate) {
           design.runs.setDeliverableValidation?.(run, deliverable);
           deliverableValid = deliverable.valid;
+          if (!deliverable.valid && strategyTaskAtStart) {
+            console.info('[od-next-task] completion evidence rejected', {
+              taskExecutionId: strategyTaskAtStart.taskExecutionId,
+              runId: run.id,
+              inputStage: strategyTaskAtStart.inputStage,
+              validation: deliverable.validation,
+            });
+          }
         }
         // Host-owned syntax finalization is based on physical delivery, not on
         // OD Next strategy identity. It never resumes or prompts the Agent.
