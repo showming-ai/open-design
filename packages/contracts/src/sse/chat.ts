@@ -1,5 +1,10 @@
 import type { LiveArtifactRefreshStatus } from '../api/live-artifacts.js';
-import type { RunFailureAction, RunFailureCategory, RunFailureDetail } from '../api/chat.js';
+import type {
+  AgentEventPayloadTruncation,
+  RunFailureAction,
+  RunFailureCategory,
+  RunFailureDetail,
+} from '../api/chat.js';
 import type { RunMediaTaskFailure } from '../api/media.js';
 import type {
   DeliverableSyntaxRepairState,
@@ -402,6 +407,26 @@ export type DaemonAgentPayload =
     }
   | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean; completedAt?: number }
   | { type: 'usage'; usage?: { input_tokens?: number; output_tokens?: number }; costUsd?: number; durationMs?: number; stopReason?: string | null }
+  /**
+   * Per-request token usage for one model request inside a run. Emitted once
+   * per assistant `message`, keyed by `requestId` (the provider `msg_…` id).
+   * The run-level `usage` event above collapses every request into a single
+   * aggregate; this event carries the per-request granularity so cost/
+   * percentile analysis can graduate from run-level to request-level
+   * (#3408 / #3547 follow-up B). The per-request token sum reconciles against
+   * the run-level `result.usage`. `claude-stream-json` only for now — other
+   * runtime families ship their own per-request shapes in follow-ups.
+   */
+  | {
+      type: 'request_usage';
+      requestId: string;
+      usage: {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+      };
+    }
   | { type: 'fabricated_role_marker'; marker: string; messageId?: string }
   // The agent is stuck repeating failing tool calls (see tool-loop-guard.ts).
   // `action: 'warn'` is an early heads-up the run may be looping; `'halt'` means
@@ -416,7 +441,9 @@ export type DaemonAgentPayload =
       signature: string;
       count: number;
     }
-  | { type: 'raw'; line: string };
+  // A stdout line the parser did not recognise. The daemon bounds it before it
+  // is streamed or stored; `truncated` is present when it was shortened.
+  | { type: 'raw'; line: string; truncated?: AgentEventPayloadTruncation };
 
 /**
  * The run-level automatic retry the daemon just started, as the browser sees it.

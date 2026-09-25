@@ -2,6 +2,8 @@ import {
   createOpenCodeRootTaskEvidenceCollector,
   type OpenCodeTaskTerminalCandidate,
 } from './opencode-child-evidence.js';
+import { OpenCodeToolEvents } from './opencode-tool-events.js';
+import { boundedRawAgentEvent } from './run-event-payload-budget.js';
 
 type JsonObject = Record<string, unknown>;
 type StreamEvent = Record<string, unknown>;
@@ -9,6 +11,7 @@ type StreamEventHandler = (event: StreamEvent) => void;
 type ParserKind = string;
 
 type ParserState = {
+  openCodeToolEvents: OpenCodeToolEvents;
   cursorTextSoFar: string;
   cursorTurnStart: number;
   openCodeToolUses: Set<string>;
@@ -212,6 +215,7 @@ function openCodeToolResult(
 
 function handleOpenCodeEvent(obj: unknown, onEvent: StreamEventHandler, state: ParserState): boolean {
   if (!isRecord(obj)) return false;
+  if (state.openCodeToolEvents.handle(obj, onEvent)) return true;
   const part = isRecord(obj.part) ? obj.part : {};
 
   if (obj.type === 'step_start') {
@@ -224,6 +228,7 @@ function handleOpenCodeEvent(obj: unknown, onEvent: StreamEventHandler, state: P
       typeof obj.sessionID === 'string' && obj.sessionID.length > 0
         ? obj.sessionID
         : null;
+    state.openCodeToolEvents.startSession(sessionId, onEvent);
     onEvent({ type: 'status', label: 'running', sessionId });
     return true;
   }
@@ -234,6 +239,7 @@ function handleOpenCodeEvent(obj: unknown, onEvent: StreamEventHandler, state: P
   }
 
   if (obj.type === 'tool_use' && typeof part.tool === 'string' && typeof part.callID === 'string') {
+    state.openCodeToolEvents.complete(part.callID);
     const statePart = isRecord(part.state) ? part.state : null;
     const key = `${obj.sessionID || 'session'}:${part.callID}`;
     if (!state.openCodeToolUses.has(key)) {
@@ -1330,6 +1336,7 @@ function handleCodexEvent(obj: unknown, onEvent: StreamEventHandler, state: Pars
 
 function createParserState(): ParserState {
   return {
+    openCodeToolEvents: new OpenCodeToolEvents(),
     cursorTextSoFar: '',
     cursorTurnStart: 0,
     openCodeToolUses: new Set<string>(),
@@ -1388,12 +1395,17 @@ export function createJsonEventStreamHandler(
     ? createOpenCodeRootTaskEvidenceCollector(options.openCodeChildEvidence)
     : null;
 
+  // Unrecognised lines are streamed to the browser and persisted as `raw`
+  // events that nothing renders. They are bounded here, at the source, so the
+  // live SSE fan-out, the daemon's run event buffer and the stored transcript
+  // all carry the same bounded line — a cursor-agent `editToolCall` completion
+  // alone repeats the edited file twice (see run-event-payload-budget.ts).
   function handleLine(line: string): void {
     let obj: unknown;
     try {
       obj = JSON.parse(line);
     } catch {
-      onEvent({ type: 'raw', line });
+      onEvent(boundedRawAgentEvent(line, null));
       return;
     }
 
@@ -1405,7 +1417,7 @@ export function createJsonEventStreamHandler(
     if (kind === 'cursor-agent' && handleCursorEvent(obj, onEvent, state)) return;
     if (kind === 'codex' && handleCodexEvent(obj, onEvent, state)) return;
 
-    onEvent({ type: 'raw', line });
+    onEvent(boundedRawAgentEvent(line, obj));
   }
 
   function feed(chunk: string): void {
@@ -1423,6 +1435,7 @@ export function createJsonEventStreamHandler(
     const rem = buffer.trim();
     buffer = '';
     if (rem) handleLine(rem);
+    if (kind === 'opencode') state.openCodeToolEvents.flush(onEvent);
     flushPendingArtifactText(state, onEvent);
   }
 

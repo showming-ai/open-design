@@ -868,6 +868,24 @@ export type ChatRunResultPackageResponse = RunResultPackageResponse;
 
 export interface ChatRunListResponse {
   runs: ChatRunStatusResponse[];
+  /**
+   * Projects holding an unanswered `<question-form>` / `<ask-question>`.
+   *
+   * `ChatRunStatus` cannot express "waiting on the user": that state outlives
+   * the run that asked, so the run itself reads `succeeded` while the project
+   * is still blocked — see `ProjectDisplayStatus.awaiting_input`, which the
+   * daemon composes from exactly this set. Callers that render a per-project
+   * status from the runs feed need it or they will show such a project as
+   * finished.
+   *
+   * Always a subset of the projects the accompanying `runs` already expose —
+   * never the raw query — so it cannot widen what a caller can see. A project
+   * that has no visible run therefore never appears here, which is harmless:
+   * awaiting_input only arises from a run that asked.
+   *
+   * Optional: older daemons omit it, and absent means "unknown", not "none".
+   */
+  awaitingInputProjectIds?: string[];
 }
 
 export interface ChatRunCancelResponse {
@@ -949,6 +967,25 @@ export interface ChatCommentAttachment {
   /** `'query'` means `comment` was promoted to the message text; keep target data as context only. */
   commentContext?: 'context' | 'query';
   source?: 'saved-comment' | 'board-batch';
+}
+
+/**
+ * Present on a run event whose payload the daemon shortened so the event stays
+ * within its storage budget (a persisted run event never carries an unbounded
+ * payload — see `apps/daemon/src/runtimes/run-event-payload-budget.ts`).
+ *
+ * The shortened text itself also carries an inline `[open-design: …]` marker
+ * naming what was cut, so a client that rebuilds the event without this field
+ * still shows that the payload is incomplete. Absent on events that fit, and on
+ * every event written before the budget existed.
+ */
+export interface AgentEventPayloadTruncation {
+  /**
+   * UTF-8 byte length of the payload before it was shortened: `line` for
+   * `raw`, `content` for `tool_result`, the serialized `input` for
+   * `tool_use`, the whole serialized event for any other kind.
+   */
+  originalBytes: number;
 }
 
 export type PersistedAgentEvent =
@@ -1062,9 +1099,10 @@ export type PersistedAgentEvent =
    *
    * Persisted with the turn's other events so a reloaded conversation shows
    * the same three rows it showed live. Turns recorded before this event
-   * existed have none, and MUST render no next-step row at all — there is no
-   * legacy fallback, because the suggestions are about the specific thing that
-   * turn built and cannot be reconstructed after the fact.
+   * existed have none. Normally no next-step row is rendered; OPEND-2776
+   * permits the UI's three image actions when a successful turn has its own
+   * nonempty image deliverables. That fallback does not manufacture an event
+   * or infer generated images from user attachments or project history.
    */
   | { kind: 'next_steps'; suggestions: string[] }
   /**
@@ -1127,12 +1165,16 @@ export type PersistedAgentEvent =
       input: unknown;
       /** Optional wall-clock ms when the tool first started (e.g. ACP first frame). */
       startedAt?: number;
+      /** See {@link AgentEventPayloadTruncation}. */
+      truncated?: AgentEventPayloadTruncation;
     }
   | {
       kind: 'tool_result';
       toolUseId: string;
       content: string;
       isError: boolean;
+      /** See {@link AgentEventPayloadTruncation}. */
+      truncated?: AgentEventPayloadTruncation;
       /**
        * Wall-clock ms when the call finished. Pairs with `tool_use.startedAt` so the
        * UI can show a per-call duration. Optional on purpose: several adapters emit
@@ -1177,7 +1219,23 @@ export type PersistedAgentEvent =
        *  projection can read a truncation as incomplete after reload (#1247). */
       stopReason?: string;
     }
-  | { kind: 'raw'; line: string };
+  // Per-request token usage for one model request (assistant `message`),
+  // keyed by `requestId` (provider `msg_…` id). Persisted alongside the
+  // run-level `usage` record so request-level cost/percentile analysis has a
+  // durable source; the per-request token sum reconciles with `usage`.
+  | {
+      kind: 'request_usage';
+      requestId: string;
+      inputTokens?: number;
+      outputTokens?: number;
+      cacheCreationInputTokens?: number;
+      cacheReadInputTokens?: number;
+    }
+  /**
+   * A stdout line the agent's parser did not recognise. Nothing renders it; it
+   * is kept as a bounded breadcrumb (`truncated` says when it was shortened).
+   */
+  | { kind: 'raw'; line: string; truncated?: AgentEventPayloadTruncation };
 
 /**
  * What a chat card DRAWS.
