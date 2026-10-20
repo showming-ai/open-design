@@ -1235,6 +1235,8 @@ export interface CommentPopoverClickProps {
   page_name: 'artifact';
   area: 'comment_popover';
   element: 'save_comment' | 'send_to_chat' | 'add_note';
+  /** Saved comments selected at click time; does not imply queue acceptance. */
+  submitted_comment_ids?: string[];
   artifact_id?: string;
   artifact_kind?: TrackingArtifactKind;
   project_id: string;
@@ -1384,6 +1386,15 @@ export interface DeckViewerClickProps {
   slide_count?: number;
 }
 
+export interface ShareGuideClickProps {
+  page_name: 'artifact';
+  area: 'share_guide';
+  element: 'try_share' | 'close' | 'never_show_again';
+  project_id: string;
+  project_kind: TrackingProjectKind | null;
+  artifact_id: string;
+}
+
 export interface ShareOptionPopoverClickProps {
   page_name: 'artifact';
   area: 'share_option_popover';
@@ -1398,6 +1409,8 @@ export interface ShareOptionPopoverClickProps {
     | 'publish_required_guide'
     | 'publish_file'
     | 'copy_publish_link';
+  /** Existing stable alias at click time, if known. */
+  publish_id?: string;
   artifact_id: string;
   artifact_kind: TrackingArtifactKind;
   project_id: string;
@@ -1407,7 +1420,7 @@ export interface ShareOptionPopoverClickProps {
 // Provenance of an HTML file version, mirroring the daemon's
 // ProjectFileVersion.source: 'ai' = written by a run, 'manual' = manual
 // edit/undo/redo, 'restore' = created by restoring an older version.
-export type TrackingFileVersionSource = 'ai' | 'manual' | 'restore';
+export type TrackingFileVersionSource = 'ai' | 'manual' | 'restore' | 'sync';
 
 // Clicks inside the HTML file version history modal (opened via the artifact
 // toolbar `versions` element). `restore` opens the confirm popover;
@@ -1759,6 +1772,7 @@ export type UiClickProps =
   | PresentPopoverClickProps
   | DeckViewerClickProps
   | ShareOptionPopoverClickProps
+  | ShareGuideClickProps
   | FileVersionModalClickProps
   | ConversationForkClickProps
   | AssistantFeedbackButtonClickProps

@@ -55,6 +55,8 @@ import {
   memoryToastSubscriptionMode,
 } from './components/MemoryToast';
 import { Toast } from './components/Toast';
+import { DeletedShareNotices } from './components/project-actions/DeletedShareNotices';
+import { useDeletedShareNotices } from './components/project-actions/useDeletedShareNotices';
 import { CenteredLoader } from './components/Loading';
 import { PetOverlay, type PetTaskCenter } from './components/pet/PetOverlay';
 import { buildPetTaskCenter } from './components/pet/taskCenter';
@@ -64,6 +66,9 @@ import {
   type ProjectRenameFenceToken,
   type ProjectNameAuthorityResolution,
 } from './components/ProjectView';
+import type { ObservedPublicShareLink, ObservedShareUpdateRequest } from './components/share/observed-public-share-link';
+import type { ShareLoginReturn } from './components/share/share-login-return';
+import { SignedOutObservedShare } from './components/share/SignedOutObservedShare';
 import { ProjectCreationPendingView } from './components/ProjectCreationPendingView';
 import { projectsForWorkspaceChrome } from './runtime/workspace-chrome-projects';
 import { AmrArtifactUpgradeGate } from './components/AmrArtifactUpgradeGate';
@@ -95,7 +100,7 @@ import {
   type SettingsHighlight,
 } from './components/SettingsDialog';
 import { PrivacyConsentModal } from './components/PrivacyConsentModal';
-import { TestCampaignModal } from './components/TestCampaignModal';
+import { TestCampaignModal, observeTestRuntimeIdentity } from './components/TestCampaignModal';
 import { ProductionCampaignModal } from './components/ProductionCampaignModal';
 import {
   clearHomeComposerAttachments,
@@ -119,7 +124,7 @@ import {
   RUNS_CHANGED_EVENT,
   fetchAmrModels,
   fetchVelaLoginStatus,
-  listProjectRuns,
+  listProjectRunsWithScope,
   type VelaLoginStatus,
 } from './providers/daemon';
 import {
@@ -918,6 +923,33 @@ export async function hydrateReadyTeamProject(
   return summary.project;
 }
 
+/**
+ * What the user reads when a Home send's optimistic project creation fails.
+ *
+ * Product copy (OPEND-2849, 《报错文案｜精简版》): a create request that never
+ * reached the local daemon is S28a 「本地连接已断开」; a daemon that rejects the
+ * create as not signed in (`AMR_AUTH_REQUIRED`) is S03 「Open Design 尚未登录」.
+ * Both are "title\nbody" keys, rendered as the toast's title + details. The
+ * transport classification is the same one `HomeView` uses for its own error
+ * block. Any other failure keeps its existing text.
+ */
+function homeCreateFailureNotice(
+  err: unknown,
+  t: (key: 'home.createTimedOut' | 'home.daemonRecovering' | 'entry.authExpiredBody') => string,
+  fallback: string,
+): string {
+  if (err instanceof ProjectCreateError && err.code === 'PROJECT_CREATE_PREPARATION_TIMEOUT') {
+    return t('home.createTimedOut');
+  }
+  if (err instanceof TypeError || (err instanceof ProjectCreateError && err.status === null)) {
+    return t('home.daemonRecovering');
+  }
+  if (err instanceof ProjectCreateError && err.code === 'AMR_AUTH_REQUIRED') {
+    return t('entry.authExpiredBody');
+  }
+  return fallback;
+}
+
 export function App() {
   // `reducedMotion="user"` makes every motion/react component honor the OS
   // `prefers-reduced-motion` setting: transform/layout animations are zeroed
@@ -936,7 +968,7 @@ export function App() {
 }
 
 function AppInner() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const iframeKeepAlivePool = useIframeKeepAlivePool();
   const clientType = useMemo(() => detectClientType(), []);
   const hostPlatform = useMemo(() => getOpenDesignHost()?.client.platform, []);
@@ -967,6 +999,10 @@ function AppInner() {
     accountGeneration: number;
   } | null>(null);
   workspaceContextRef.current = workspaceContext;
+  const deletedShares = useDeletedShareNotices(
+    workspaceResourceReadContext(workspaceContextState),
+    workspaceContextState.resourceReadIdentity?.generation,
+  );
   workspaceContextStateRef.current = workspaceContextState;
   const listCurrentWorkspaceProjects = useCallback(
     (options?: { throwOnError?: boolean; workspaceView?: WorkspaceProjectListView }) => {
@@ -1374,6 +1410,10 @@ function AppInner() {
   }, []);
   const [dsLoading, setDsLoading] = useState(true);
   const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectListFailure, setProjectListFailure] = useState<{
+    displayKey: string;
+    generation: number;
+  } | null>(null);
   const [promptTemplatesLoading, setPromptTemplatesLoading] = useState(true);
   // Goes true once the daemon-persisted config (agentId/designSystemId/etc.)
   // has merged into local state. Auto-selection effects below wait on this
@@ -1569,6 +1609,16 @@ function AppInner() {
     };
   }, []);
 
+  const recordProjectListFailure = useCallback((request: ProjectListRequest) => {
+    if (
+      request.generation === projectListRequestGenerationRef.current
+      && request.accountGeneration === currentWorkspaceAccountGeneration()
+      && request.scopeKey === projectListScopeKey(workspaceContextRef.current)
+    ) {
+      setProjectListFailure({ displayKey: request.displayKey, generation: request.generation });
+    }
+  }, []);
+
   const reconcileFetchedProjects = useCallback((list: Project[], request: ProjectListRequest) => {
     if (
       request.accountGeneration !== currentWorkspaceAccountGeneration()
@@ -1644,6 +1694,10 @@ function AppInner() {
       return true;
     }
     latestAppliedProjectListGenerationRef.current = request.generation;
+    setProjectListFailure((failure) =>
+      failure?.displayKey === request.displayKey && request.generation >= failure.generation
+        ? null
+        : failure);
     setAppliedProjectListWitness({
       scopeKey: request.scopeKey,
       generation: request.generation,
@@ -1708,6 +1762,47 @@ function AppInner() {
   // globals effect below reads it; the sync effects live next to the
   // other AMR plumbing further down.
   const [amrLoginStatus, setAmrLoginStatus] = useState<VelaLoginStatus | null>(null);
+  // A public URL is a capability. Retain only the last exact active-share GET
+  // observed under this App's authenticated account, in memory, for S13 copy.
+  const [observedPublicShareLink, setObservedPublicShareLink] = useState<
+    (ObservedPublicShareLink & { accountId: string }) | null
+  >(null);
+  const [loginUpdateRequest, setLoginUpdateRequest] = useState<ObservedShareUpdateRequest | null>(null);
+  const loginUpdateNonceRef = useRef(0);
+  // Above ProjectView's authorization lifetime: login deliberately remounts
+  // that subtree, but the user's exact first-share panel should return.
+  const [shareLoginReturn, setShareLoginReturn] = useState<ShareLoginReturn | null>(null);
+  const onShareLoginReturnChange = useCallback((request: ShareLoginReturn | null) => {
+    if (!request) { setShareLoginReturn(null); return; }
+    const current = routeRef.current;
+    if (current.kind !== 'project' || current.projectId !== request.projectId
+      || (current.fileName !== null && current.fileName !== request.filePath)) return;
+    setShareLoginReturn(request);
+    // Pin the active file so a fresh workspace does not select a sibling tab.
+    navigate({ ...current, fileName: request.filePath });
+  }, []);
+  useEffect(() => {
+    if (!shareLoginReturn) return;
+    const remaining = shareLoginReturn.expiresAt - Date.now();
+    if (remaining <= 0 || route.kind !== 'project' || route.projectId !== shareLoginReturn.projectId
+      || (route.fileName !== null && route.fileName !== shareLoginReturn.filePath)) {
+      setShareLoginReturn(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setShareLoginReturn(null), remaining);
+    return () => window.clearTimeout(timer);
+  }, [route, shareLoginReturn]);
+  const onLoginUpdateRequestHandled = useCallback((nonce: number) => {
+    setLoginUpdateRequest((current) => current?.nonce === nonce ? null : current);
+  }, []);
+
+  const testRuntimeAuthenticated = isAmrSessionAuthenticated(amrLoginStatus);
+  const testRuntimeOwner = amrLoginStatus?.user?.id ?? null;
+  useEffect(() => {
+    // Home hosts unmount on navigation; identity changes elsewhere still
+    // spend their in-process replay grants, including a change back later.
+    observeTestRuntimeIdentity(testRuntimeAuthenticated, testRuntimeOwner, locale);
+  }, [testRuntimeAuthenticated, testRuntimeOwner, locale]);
   // Inline AMR auth can invalidate the caller identity and intentionally tear
   // down ProjectView before the login poll reports success. Keep only the
   // exact failed-turn continuation above that authorization lifetime; the
@@ -1762,6 +1857,38 @@ function AppInner() {
   // snapshot updates `agents`, which makes Settings fetch status again and
   // creates a status -> models -> agents request loop.
   const amrLoginStatusRef = useRef<VelaLoginStatus | null>(null);
+  const onObservedPublicShareLink = useCallback((share: ObservedPublicShareLink | null) => {
+    if (share === null) { setObservedPublicShareLink(null); return; }
+    const account = amrLoginStatusRef.current;
+    const currentRoute = routeRef.current;
+    const authority = projectRouteWorkspaceContextRef.current;
+    if (share.status !== 'active' || !share.url || !share.slug
+      || !share.authorizationScopeKey.startsWith('workspace:')
+      || !isAmrSessionAuthenticated(account) || !account?.user?.id
+      || currentRoute.kind !== 'project' || currentRoute.projectId !== share.projectId
+      || (currentRoute.fileName !== null && currentRoute.fileName !== share.filePath)
+      || !authority || authority.workspaceId !== share.workspaceId
+      || authority.workspaceMemberId !== share.workspaceMemberId) return;
+    setObservedPublicShareLink({ ...share, accountId: account.user.id });
+  }, []);
+  useEffect(() => {
+    if (!observedPublicShareLink) return;
+    if (route.kind !== 'project' || route.projectId !== observedPublicShareLink.projectId
+      || (route.fileName !== null && route.fileName !== observedPublicShareLink.filePath)
+      || (isAmrSessionAuthenticated(amrLoginStatus) && amrLoginStatus?.user?.id !== observedPublicShareLink.accountId)) {
+      setObservedPublicShareLink(null);
+    }
+  }, [route, amrLoginStatus, observedPublicShareLink]);
+  useEffect(() => {
+    if (!loginUpdateRequest) return;
+    if (Date.now() > loginUpdateRequest.expiresAt
+      || route.kind !== 'project' || route.projectId !== loginUpdateRequest.link.projectId
+      || (route.fileName !== null && route.fileName !== loginUpdateRequest.link.filePath)
+      || (isAmrSessionAuthenticated(amrLoginStatus) && amrLoginStatus?.user?.id !== loginUpdateRequest.accountId)) {
+      setLoginUpdateRequest(null);
+    }
+  }, [route, amrLoginStatus, loginUpdateRequest]);
+
   const applyAmrLoginStatus = useCallback((
     status: VelaLoginStatus,
     options: { forceModelRefresh?: boolean; restartOnSignIn?: boolean } = {},
@@ -2058,12 +2185,19 @@ function AppInner() {
           || amrLoginStatus?.sessionState === 'reauth_required'
         )
       );
+    // Keep this exact file route only when its public URL was witnessed under
+    // the authenticated workspace. Project reads still fail closed below;
+    // the signed-out surface exposes that URL and no mutation authority.
+    if (observedPublicShareLink && route.kind === 'project'
+      && route.projectId === observedPublicShareLink.projectId
+      && route.fileName === observedPublicShareLink.filePath) return;
     if (!cloudIdentityRejected) return;
     if (route.kind === 'home' && route.view === 'onboarding') return;
     navigate({ kind: 'home', view: 'onboarding' }, { replace: true });
   }, [
     amrLoginStatus,
     config.agentId,
+    observedPublicShareLink,
     config.mode,
     route,
     workspaceContextState.failure,
@@ -2203,11 +2337,14 @@ function AppInner() {
 
       const request = beginProjectListRequest(workspaceProjectViewRef.current);
       void listCurrentWorkspaceProjects({
+        throwOnError: true,
         workspaceView: workspaceProjectViewRef.current,
       }).then((list) => {
-        if (cancelled) return;
-        reconcileFetchedProjects(list, request);
-        setProjectsLoading(false);
+        if (!cancelled) reconcileFetchedProjects(list, request);
+      }).catch(() => {
+        if (!cancelled) recordProjectListFailure(request);
+      }).finally(() => {
+        if (!cancelled) setProjectsLoading(false);
       });
 
       void listTemplates().then((list) => {
@@ -2339,6 +2476,7 @@ function AppInner() {
     isCurrentAgentStreamRequest,
     listCurrentWorkspaceProjects,
     reconcileFetchedProjects,
+    recordProjectListFailure,
   ]);
 
   // Keep the active projection's last-good display in sync with optimistic
@@ -2440,20 +2578,24 @@ function AppInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const refreshProjects = useCallback(async () => {
-    const request = beginProjectListRequest(workspaceProjectView);
-    const list = await listCurrentWorkspaceProjects({ workspaceView: workspaceProjectView });
-    reconcileFetchedProjects(list, request);
-  }, [beginProjectListRequest, listCurrentWorkspaceProjects, reconcileFetchedProjects, workspaceProjectView]);
-
   const refreshProjectsStrict = useCallback(async () => {
     const request = beginProjectListRequest(workspaceProjectView);
-    const list = await listCurrentWorkspaceProjects({
-      throwOnError: true,
-      workspaceView: workspaceProjectView,
-    });
-    reconcileFetchedProjects(list, request);
-  }, [beginProjectListRequest, listCurrentWorkspaceProjects, reconcileFetchedProjects, workspaceProjectView]);
+    try {
+      const list = await listCurrentWorkspaceProjects({
+        throwOnError: true,
+        workspaceView: workspaceProjectView,
+      });
+      reconcileFetchedProjects(list, request);
+    } catch (error) {
+      recordProjectListFailure(request);
+      throw error;
+    }
+  }, [beginProjectListRequest, listCurrentWorkspaceProjects, reconcileFetchedProjects, recordProjectListFailure, workspaceProjectView]);
+
+  const refreshProjects = useCallback(
+    () => refreshProjectsStrict().catch(() => {}),
+    [refreshProjectsStrict],
+  );
 
   const refreshProjectsAfterTeamCatalogChange = useCallback(() => {
     const context = workspaceContextRef.current;
@@ -2511,6 +2653,7 @@ function AppInner() {
             await new Promise((resolve) => setTimeout(resolve, 1200));
             continue;
           }
+          recordProjectListFailure(request);
           console.error('[projects] failed to refresh after workspace switch', err);
         }
       }
@@ -2527,6 +2670,7 @@ function AppInner() {
     effectiveWorkspaceProjectView,
     listCurrentWorkspaceProjects,
     reconcileFetchedProjects,
+    recordProjectListFailure,
   ]);
 
   const refreshDesignSystems = useCallback(async (options?: {
@@ -3142,10 +3286,7 @@ function AppInner() {
       (input.metadata?.promptTemplate?.prompt?.trim() || undefined);
 
       const metadata = mergeLinkedDirsIntoMetadata(input.metadata, input.linkedDirs);
-      const kind = metadata?.kind ?? null;
       const fidelity = fidelityToTracking(metadata?.fidelity ?? null);
-      const creationSource: 'blank' | 'template' | 'zip' | 'folder' =
-        kind === 'template' ? 'template' : 'blank';
       let createWorkspaceContext: WorkspaceCollabContext | null = null;
       let optimisticProjectId: string | null = input.optimisticProjectId ?? null;
       let result;
@@ -3227,10 +3368,7 @@ function AppInner() {
           rollbackOptimisticProjectCreation(
             optimisticProjectId,
             stagedFiles,
-            err instanceof ProjectCreateError
-            && err.code === 'PROJECT_CREATE_PREPARATION_TIMEOUT'
-              ? t('home.createTimedOut')
-              : errorCode,
+            homeCreateFailureNotice(err, t, errorCode),
           );
           return false;
         }
@@ -4091,18 +4229,21 @@ function AppInner() {
     }
 
     let cancelled = false;
+    let id: number | undefined;
     const refresh = async () => {
-      const runs = await listProjectRuns();
+      const { runs, scopeRequired } = await listProjectRunsWithScope();
       if (cancelled) return;
+      // A deterministic PROJECT_SCOPE_REQUIRED will not change on retry.
+      if (scopeRequired) window.clearInterval(id);
       setPetTaskCenter(buildPetTaskCenter(projects, runs));
     };
     const handleRunsChanged = () => {
       void refresh();
     };
 
+    id = window.setInterval(refresh, 2000);
     void refresh();
     window.addEventListener(RUNS_CHANGED_EVENT, handleRunsChanged);
-    const id = window.setInterval(refresh, 2000);
     return () => {
       cancelled = true;
       window.removeEventListener(RUNS_CHANGED_EVENT, handleRunsChanged);
@@ -4121,7 +4262,7 @@ function AppInner() {
     // visible, because this call sent no workspace headers at all).
     const mutationContext = workspaceContextRef.current;
     const mutationAccountGeneration = currentWorkspaceAccountGeneration();
-    await deleteProjectApi(id, mutationContext);
+    await deleteProjectApi(id, mutationContext, deletedShares.capture(id, mutationContext, mutationAccountGeneration));
     if (mutationContext) {
       removeProjectFromDisplaySnapshots({
         accountGeneration: mutationAccountGeneration,
@@ -4137,7 +4278,7 @@ function AppInner() {
       navigate({ kind: 'home', view: 'home' });
     }
     return true;
-  }, [clearLocalProject, iframeKeepAlivePool, route]);
+  }, [clearLocalProject, iframeKeepAlivePool, route, deletedShares.capture]);
 
   const handleRenameProject = useCallback(async (id: string, name: string) => {
     const trimmed = name.trim();
@@ -4757,10 +4898,10 @@ function AppInner() {
   // window, and once the hub has confirmed team membership even once, never
   // fall through to the not-found/navigate-home path for this project — only
   // a hub-confirmed absence does.
+  const routeProjectListed = route.kind === 'project' && projects.some((p) => p.id === route.projectId);
   useEffect(() => {
     if (route.kind !== 'project') return;
-    if (loadedActiveProject) return;
-    if (projects.some((p) => p.id === route.projectId)) return;
+    if (loadedActiveProject || routeProjectListed) return;
     let cancelled = false;
     const projectId = route.projectId;
     setDeepLinkResolutionFailure((current) =>
@@ -4936,13 +5077,19 @@ function AppInner() {
   }, [
     route,
     loadedActiveProject,
-    projects,
+    // The resolver itself reconciles the list. Depend on presence, not array
+    // identity, so its own absent→absent read cannot restart the retry budget
+    // and erase the terminal failure. Real identity changes still revalidate.
+    routeProjectListed,
+    currentProjectListScope,
+    activeAccountGeneration,
     projectsLoading,
     daemonLive,
     deepLinkRetryRevision,
     beginProjectListRequest,
     listCurrentWorkspaceProjects,
     reconcileFetchedProjects,
+    recordProjectListFailure,
   ]);
 
   const openSettings = useCallback((
@@ -5054,7 +5201,7 @@ function AppInner() {
     });
   }, []);
 
-  const handleTuckPet = useCallback(
+  const _handleTuckPet = useCallback(
     () => handleSetPetEnabled(false),
     [handleSetPetEnabled],
   );
@@ -5350,6 +5497,9 @@ function AppInner() {
             action,
             chipId: target.chipId,
             projectKind: target.projectKind,
+            asExample: target.asExample,
+            // Community records its own use click.
+            useTracked: true,
           }));
           navigate({ kind: 'home', view: 'home' });
         }}
@@ -5437,6 +5587,38 @@ function AppInner() {
         />
       </div>
     ) : null;
+    const signedOutObservedShare = observedPublicShareLink
+      && route.kind === 'project' && route.projectId === observedPublicShareLink.projectId
+      && route.fileName === observedPublicShareLink.filePath
+      && amrLoginStatus?.loggedIn === false && amrLoginStatus.loginInFlight !== true
+      && (activeProject
+        ? activeProject.id === observedPublicShareLink.projectId
+          && activeProject.workspaceId === observedPublicShareLink.workspaceId
+          && projectRouteWorkspaceContext.failure !== undefined
+          && activeProjectWorkspaceContext === null
+        : routeSurfaceState === 'missing')
+        ? observedPublicShareLink : null;
+    const signedOutShareFallback = signedOutObservedShare ? (
+      <div className="entry-shell entry-shell--no-header">
+        <SignedOutObservedShare
+          url={signedOutObservedShare.url}
+          canUpdate={signedOutObservedShare.freshness === 'outdated'}
+          onLoginUpdateSuccess={() => {
+            if (signedOutObservedShare.freshness !== 'outdated') return;
+            setLoginUpdateRequest({
+              nonce: ++loginUpdateNonceRef.current, accountId: signedOutObservedShare.accountId,
+              link: signedOutObservedShare, expiresAt: Date.now() + 60_000,
+            });
+          }}
+        />
+      </div>
+    ) : null;
+    const localObservedShare = observedPublicShareLink
+      && activeProject?.id === observedPublicShareLink.projectId
+      && route.kind === 'project' && route.fileName === observedPublicShareLink.filePath
+      && activeProject.workspaceId === null && activeProjectWorkspaceContext === null
+      && amrLoginStatus?.loggedIn === false && amrLoginStatus.loginInFlight !== true
+        ? observedPublicShareLink : null;
     if (pendingFrame && !pendingCreation?.created) {
       appMain = pendingFrame;
     } else if (
@@ -5458,7 +5640,7 @@ function AppInner() {
       );
     } else if (routeSurfaceState !== 'ready') {
       const canRetry = routeSurfaceState === 'materialization-failed';
-      appMain = pendingFrame ?? (
+      appMain = pendingFrame ?? signedOutShareFallback ?? (
         <div className="entry-shell entry-shell--no-header">
           <div className="centered-loader">
             <span role="alert">
@@ -5482,13 +5664,14 @@ function AppInner() {
       );
     } else if (
       activeProject
+      && !localObservedShare
       && projectRouteWorkspaceContext.failure
       && (
         projectRouteWorkspaceContext.failure === 'forbidden'
         || activeProjectWorkspaceContext === null
       )
     ) {
-      appMain = pendingFrame ?? (
+      appMain = pendingFrame ?? signedOutShareFallback ?? (
         <div className="entry-shell entry-shell--no-header">
           <div className="centered-loader">
             <span role="alert">
@@ -5539,6 +5722,12 @@ function AppInner() {
           projectAuthorizationKey={
             activeProjectAuthorizationKey ?? activeProject.id
           }
+          onObservedPublicShareLink={onObservedPublicShareLink}
+          observedPublicShareLink={signedOutObservedShare ?? localObservedShare}
+          loginUpdateRequest={loginUpdateRequest}
+          onLoginUpdateRequestHandled={onLoginUpdateRequestHandled}
+          shareLoginReturn={shareLoginReturn}
+          onShareLoginReturnChange={onShareLoginReturnChange}
           amrAuthRetryContinuation={amrAuthRetryContinuation}
           onArmAmrAuthRetryContinuation={armAmrAuthRetryContinuation}
           onConsumeAmrAuthRetryContinuation={consumeAmrAuthRetryContinuation}
@@ -5638,6 +5827,7 @@ function AppInner() {
           workspaceDesignSystems.identity !== currentWorkspaceCatalogIdentity || dsLoading
         }
         projectsLoading={projectsLoading}
+        projectsLoadFailed={projectListFailure?.displayKey === currentProjectDisplayKey}
         promptTemplatesLoading={promptTemplatesLoading}
         onCreateProject={handleCreateProject}
         onCreatePluginShareProject={handleCreatePluginShareProject}
@@ -5718,6 +5908,10 @@ function AppInner() {
               ? activeProject.workspaceId ?? null
               : undefined
           }
+          preserveSignedOutShareRoute={Boolean(observedPublicShareLink
+            && route.kind === 'project' && route.projectId === observedPublicShareLink.projectId
+            && route.fileName === observedPublicShareLink.filePath
+            && amrLoginStatus?.loggedIn === false && amrLoginStatus.loginInFlight !== true)}
           onboardingCompleted={config.onboardingCompleted === true}
           identityScopeKey={workspaceTabsIdentityScopeKey}
           workspaceContext={workspaceContext}
@@ -5849,6 +6043,7 @@ function AppInner() {
             ),
         })}
       />
+      <DeletedShareNotices state={deletedShares} />
       {workingDirError ? (
         <Toast
           message={workingDirError}
@@ -5858,7 +6053,10 @@ function AppInner() {
       ) : null}
       {projectCreateError ? (
         <Toast
-          message={projectCreateError}
+          // 「标题\n正文」两行的定稿(S28a / S03,见 `homeCreateFailureNotice`)拆成
+          // Toast 的标题 + 正文;单行的照旧只有标题。
+          message={projectCreateError.split('\n')[0] ?? projectCreateError}
+          details={projectCreateError.includes('\n') ? projectCreateError.slice(projectCreateError.indexOf('\n') + 1) : null}
           role="alert"
           tone="error"
           onDismiss={() => setProjectCreateError(null)}

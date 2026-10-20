@@ -39,6 +39,7 @@ import {
   resolveDaemonPrewarmTargets,
   resolveWebPrewarmTargets,
 } from "./prewarm.js";
+import { resolvePackagedShareViewerEnv } from "./share-viewer.js";
 import { workspaceTeamTransportEnv } from "./workspace-team.js";
 
 const require = createRequire(import.meta.url);
@@ -61,6 +62,7 @@ const PACKAGED_CHILD_ENV_ALLOWLIST = [
   "https_proxy",
   "no_proxy",
   "OD_ALLOWED_INTERNAL_HOSTS",
+  "OD_JSON_IPC_TRACE",
 ] as const;
 
 // The daemon owns the historical-outer compatibility handoff. Preserve the
@@ -645,6 +647,12 @@ export type PackagedDaemonSpawnEnvOptions = {
    */
   velaWebUrl?: string | null;
   velaWebUrls?: Record<string, string>;
+  /**
+   * Launch environment whose explicit `OD_SHARE_VIEWER_URL(S)` debug override
+   * is forwarded (there is no channel default: AMR reports the share address).
+   * The child env allowlist would otherwise drop them.
+   */
+  shareViewerLaunchEnv?: NodeJS.ProcessEnv;
 };
 
 /**
@@ -683,6 +691,7 @@ export function buildPackagedDaemonSpawnEnv(
     ...(options.velaWebUrls == null || Object.keys(options.velaWebUrls).length === 0
       ? {}
       : { OD_VELA_WEB_URLS: JSON.stringify(options.velaWebUrls) }),
+    ...resolvePackagedShareViewerEnv(options.shareViewerLaunchEnv ?? {}),
     ...(options.appVersion == null ? {} : { OD_APP_VERSION: options.appVersion }),
     ...(options.mcpBootstrapCommand == null
       || options.mcpBootstrapCommand.length === 0
@@ -953,6 +962,7 @@ export async function startPackagedSidecars(
         posthogHost: options.posthogHost,
         velaWebUrl: options.velaWebUrl,
         velaWebUrls: options.velaWebUrls,
+        shareViewerLaunchEnv: process.env,
       }),
       electronNodeCommand: options.electronNodeCommand,
       nodeCommand: options.nodeCommand,

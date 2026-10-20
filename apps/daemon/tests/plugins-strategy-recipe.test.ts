@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -100,6 +100,48 @@ afterAll(() => {
 });
 
 describe('OD Next V2 request recipe wiring', () => {
+  it('composes the canonical motion skill with Core and orchestration for the motion route', async () => {
+    const binding = createBundledStrategyBindingV2({ plugin, taskType: 'motion-design' });
+    const motionSnapshot = applyPlugin({
+      plugin, inputs: {}, registry: EMPTY_REGISTRY, internalStrategyBinding: binding,
+    }).result.appliedPlugin;
+    const recipe = await resolveRecipe({ activeSnapshot: { ...motionSnapshot, snapshotId: 'snapshot-motion-recipe' } });
+    if (!recipe) throw new Error('expected motion recipe');
+    const prompt = composeSystemPrompt({ agentId: 'codex', sessionMode: 'design', odNextStrategyRecipe: recipe });
+    const source = await readFile(path.resolve(BUNDLED_ROOT, '../../skills/motion-design/SKILL.md'), 'utf8');
+    expect(prompt).toContain(source);
+    expect(prompt).toContain('OD Next Core Strategy');
+    expect(prompt).toContain('General Orchestration');
+    expect(prompt).not.toContain('# OD Next Task Profile: HyperFrames');
+    expect(prompt).not.toContain('<open-design-plan-contract>');
+    expect(prompt).not.toContain('<open-design-runtime-state>');
+    expect(prompt).not.toContain('planContractHash=');
+    expect(prompt).toContain('keyed');
+    expect(prompt).toContain('selected scenario or a loaded');
+  });
+
+  it.each(['prototype', 'ppt', 'marketing', 'hyperframes'] as const)(
+    'treats %s as guidance rather than overriding the current requested output', async (taskType) => {
+      const binding = createBundledStrategyBindingV2({ plugin, taskType });
+      const applied = applyPlugin({ plugin, inputs: {}, registry: EMPTY_REGISTRY, internalStrategyBinding: binding }).result.appliedPlugin;
+      const recipe = await resolveRecipe({ activeSnapshot: { ...applied, snapshotId: `intent-${taskType}` } });
+      if (!recipe) throw new Error('expected real OD Next recipe');
+      const prompt = composeSystemPrompt({ odNextStrategyRecipe: recipe });
+      expect(prompt).toBe(composeContractsSystemPrompt({ odNextStrategyRecipe: recipe }));
+      expect(prompt).toContain('Only when editing HTML that already contains data-od-comment-id');
+      expect(prompt).toContain('mint a fresh UUID for every copied or new node');
+      expect(prompt).toContain('never recycle a deleted identity');
+      expect(prompt).toContain("The user's latest explicit request determines this turn's deliverables");
+      expect(prompt).toContain('Do not add an HTML wrapper, presentation page, or extra export');
+      expect(prompt).not.toContain('propose a task-type\n   switch and wait for confirmation');
+      expect(prompt).not.toContain('is rejected as an invalid\ncanonical deliverable');
+      expect(prompt).toContain('Apply this profile only to the parts of the current request');
+      expect(prompt).not.toContain('<open-design-plan-contract>');
+      expect(prompt).not.toContain('planContractHash=');
+      expect(prompt).not.toContain('od-motion-audio');
+      expect(prompt).not.toContain('media generate --project');
+    },
+  );
 
   // Read and register the real bundled resource; no hand-authored atom fixture.
   // This witnesses the prompt contract that reaches a strategy recipe, not an
@@ -289,11 +331,12 @@ describe('OD Next V2 request recipe wiring', () => {
     expect(prompt).toContain('compact operator interfaces');
     expect(prompt).toContain('Use concise product language.');
     expect(prompt).toContain('Prioritize incident triage.');
-    expect(prompt).toContain('open-design.plan-contract/v2');
-    expect(prompt).toContain('open-design.strategy-state/v2');
-    expect(prompt).toContain('capabilitySnapshotHash');
-    expect(prompt).toContain('productionRoutes');
-    expect(prompt).toContain('decisionSummary');
+    expect(prompt).toContain('OD Next production-marker/v1');
+    expect(prompt).toContain('od-production-ready');
+    expect(prompt).not.toContain('open-design.plan-contract/v2');
+    expect(prompt).not.toContain('open-design.strategy-state/v2');
+    expect(prompt).not.toContain('capabilitySnapshotHash');
+    expect(prompt).toContain('concise, actionable plan');
     expect(prompt.split('\n').filter((line) => (
       line.startsWith('## Active stage:') || line.startsWith('### ')
     ))).toEqual(expect.arrayContaining([

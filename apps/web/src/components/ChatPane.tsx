@@ -3,6 +3,7 @@ import { conversationMetaLabel } from '../runtime/chat/conversation-time';
 export { conversationMetaLabel } from '../runtime/chat/conversation-time';
 import { QuoteBar } from './chat/QuoteBar';
 import { chatLogSelfResizeObserveDisabled } from '../runtime/chat-scroll-experiments';
+import { releaseChatScrollTakeover } from '../runtime/chat-scroll-takeover';
 import { shouldShowJumpToLatest } from '../runtime/chat/jump-to-latest';
 import {
   distanceFromBottom,
@@ -805,6 +806,12 @@ interface Props {
    */
   amrBalanceCardAnchorMessageId?: string | null;
   /**
+   * 升级卡**是谁在看**:`owner` 有充值权限,`member` 没有(只能找管理员)。
+   * 只用于锚在某一轮下面的那张卡在余额归零时的说明句(产品《报错文案》S15,
+   * OPEND-2849)。宿主读不出时按 `owner` 说 —— 那是今天的默认身份。
+   */
+  amrBalanceAudience?: 'owner' | 'member';
+  /**
    * **失败之后的那次钱包补查已经落地,而且没读出数字。**
    *
    * 只有跑到一半死在余额上那条路用得着它。那条失败自己**不带余额**,升级卡的
@@ -1031,6 +1038,11 @@ interface QueuedSendUpdate {
   meta?: ChatSendMeta;
 }
 
+interface FoldedChatMessage extends ChatMessage {
+  /** View-only ownership of physical messages merged into this row. */
+  foldedMessageIds?: string[];
+}
+
 /**
  * Fold an OD Next logical task into ONE conversation turn.
  *
@@ -1052,11 +1064,11 @@ interface QueuedSendUpdate {
  * stamped onto the `done_key` it already emits — the very event the renderer
  * uses to find the boundary — before its events are appended.
  */
-export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
+export function foldStrategyTaskTurns(messages: ChatMessage[]): FoldedChatMessage[] {
   if (!messages.some((message) => (message.strategyTaskRunIndex ?? 0) > 0)) {
     return messages;
   }
-  const folded: ChatMessage[] = [];
+  const folded: FoldedChatMessage[] = [];
   const turnHeadIndexByTask = new Map<string, number>();
   for (const message of messages) {
     const taskId = message.strategyTaskExecutionId;
@@ -1070,17 +1082,42 @@ export function foldStrategyTaskTurns(messages: ChatMessage[]): ChatMessage[] {
       folded.push({ ...message, events: stampRunSpan(message) });
       continue;
     }
+    // Run metadata arrives before its SSE boundary. Until the successor's
+    // done_key arrives, buildTurnBlocks only sees the predecessor's events:
+    // adopting the active status here would reopen that completed record and
+    // tick its clock again (OPEND-3463). Keep the pending Run as its own row;
+    // once its boundary arrives the normal fold can safely close the old Run.
+    // Terminal legacy history can still fold without protocol metadata.
+    if (
+      isActiveRunStatus(message.runStatus)
+      && !message.events?.some((event) => event.kind === 'done_key' && event.key.trim())
+    ) {
+      folded.push(message);
+      continue;
+    }
     const headIndex = turnHeadIndexByTask.get(taskId)!;
     const head = folded[headIndex]!;
     const headContent = head.content ?? '';
     const tailContent = message.content ?? '';
+    const separator = headContent && tailContent && !headContent.endsWith('\n') ? '\n\n' : '';
     folded[headIndex] = {
       ...head,
+      foldedMessageIds: [...(head.foldedMessageIds ?? [head.id]), message.id],
       content: tailContent
-        ? `${headContent}${headContent && !headContent.endsWith('\n') ? '\n\n' : ''}${tailContent}`
+        ? `${headContent}${separator}${tailContent}`
         : headContent,
       events: [...(head.events ?? []), ...stampRunSpan(message)],
+      // Preserve the final physical Run's scope for completion checks while
+      // retaining the full history for display. Live rows may already contain
+      // predecessors, tracked by these same offsets in ProjectView.
+      strategyTaskPrefixLength: headContent.length + separator.length
+        + (message.strategyTaskPrefixLength ?? 0),
+      strategyTaskPrefixEventCount: (head.events?.length ?? 0)
+        + (message.strategyTaskPrefixEventCount ?? 0),
       producedFiles: [...(head.producedFiles ?? []), ...(message.producedFiles ?? [])],
+      artifactRefs: [...new Map([
+        ...(head.artifactRefs ?? []), ...(message.artifactRefs ?? []),
+      ].map((ref) => [ref.label, ref])).values()],
       // The turn's status is the latest Run's: the earlier Runs finishing is an
       // internal step, not the turn ending.
       runId: message.runId ?? head.runId,
@@ -1375,6 +1412,7 @@ export function ChatPane({
   onOpenSettings,
   amrBalanceCardUsd = null,
   amrBalanceCardAnchorMessageId = null,
+  amrBalanceAudience = 'owner',
   amrBalanceCardUnavailable = false,
   onAmrBalanceUpgrade,
   onOpenAmrSettings,
@@ -2706,6 +2744,25 @@ export function ChatPane({
      * 这一行就是唯一还站着的。
      */
     resetWheelWitness();
+  }, [activeConversationId]);
+
+  /*
+   * 换会话 = 把滚动自愈(踢一帧 / 观察一格 / JS 接管)从这个节点上解下来。
+   *
+   * `.chat-log` 这个 div 不带 conversation key,换会话时 React 复用同一个 DOM 节点,
+   * 所以滚动冻结探针和接管模块在节点层面看不到任何「会话变了」的信号:上一条会话
+   * 里判出来的冻结会一直接管下一条**健康**会话的滚轮和键盘;探针又是「一块 surface
+   * 只报一次」,新会话真冻结了也再发不出信号。这一行两件事一起做:接管解除,探针
+   * 在下一个 scroll 事件上重新挂一块新 surface(新 probe_id、新的上报额度)。
+   * cleanup 里再调一次:面板卸载(切标签页、换路由)会把节点直接拿走而不换会话,
+   * 探针要到下一个 scroll 事件才会发现节点没了 —— 一个不存在的节点永远不会发。
+   * 判据:`tests/components/ChatPane.scroll-takeover-release.test.tsx`。
+   */
+  useEffect(() => {
+    releaseChatScrollTakeover();
+    return () => {
+      releaseChatScrollTakeover();
+    };
   }, [activeConversationId]);
 
   // ChatComposer's internal `seededRef` latches after the first
@@ -4424,6 +4481,7 @@ export function ChatPane({
                   messages={displayMessages}
                   streaming={streaming}
                   lowBalanceTurnCards={lowBalanceTurnCards}
+                  lowBalanceTurnCardAudience={amrBalanceAudience}
                   onLowBalanceTurnCardUpgrade={
                     onAmrBalanceUpgrade ?? (() => openAmrPlans('chat_upgrade_card'))
                   }
@@ -4609,6 +4667,7 @@ export function ChatPane({
                     exhausted={reconnect.exhausted}
                     manualRetry={reconnect.manualRetry}
                     reason={reconnect.reason}
+                    retryCause={reconnect.retryCause}
                     /* 〔重新连接〕只属于传输层那一行:线断了才有东西可重连。
                        daemon 重跑一轮时连接是通的,给一颗「重新连接」既没有对应的
                        动作,也会让用户以为是自己网络的问题。 */
@@ -5186,6 +5245,7 @@ function ChatRows({
   messages,
   streaming,
   lowBalanceTurnCards,
+  lowBalanceTurnCardAudience = 'owner',
   onLowBalanceTurnCardUpgrade,
   onResendUserMessage,
   onRetryImage,
@@ -5264,6 +5324,8 @@ function ChatRows({
    * 下面、第二轮跑起来时不许挪」是这样成立的,不靠任何位置计算。
    */
   lowBalanceTurnCards?: ReadonlyMap<string, number>;
+  /** 那一轮的卡在余额归零时按谁在看说话(S15),见 `ChatPane.amrBalanceAudience`。 */
+  lowBalanceTurnCardAudience?: 'owner' | 'member';
   /** 升级卡那颗按钮。落点由宿主决定,和流水末尾那张同一个 handler。 */
   onLowBalanceTurnCardUpgrade?: () => void;
   onResendUserMessage?: (message: ChatMessage) => void;
@@ -5516,7 +5578,11 @@ function ChatRows({
     return (
       <>
         {assistantRow}
-        <UpgradeCard balanceUsd={turnBalanceUsd} onUpgrade={onLowBalanceTurnCardUpgrade} />
+        <UpgradeCard
+          balanceUsd={turnBalanceUsd}
+          onUpgrade={onLowBalanceTurnCardUpgrade}
+          pausedAudience={lowBalanceTurnCardAudience}
+        />
       </>
     );
   };
@@ -6389,19 +6455,21 @@ function isFinishedTurn(message: ChatMessage): boolean {
 function archiveLowBalanceTurnCard(
   archive: Map<string, number>,
   input: {
-    messages: ChatMessage[];
+    messages: FoldedChatMessage[];
     anchorMessageId: string | null | undefined;
     balanceUsd: number | null | undefined;
   },
 ): void {
   const { anchorMessageId, balanceUsd } = input;
   if (!anchorMessageId || balanceUsd == null) return;
-  const anchor = input.messages.find((message) => message.id === anchorMessageId);
+  const anchor = input.messages.find((message) =>
+    message.id === anchorMessageId || message.foldedMessageIds?.includes(anchorMessageId),
+  );
   // 锚点不在这条会话里 = 切走了 / 那一轮被收回了。既然挂不上去,就不画 ——
   // 退回流水末尾会把一份别的会话的读数扣在这条会话的最后一轮头上。
   if (!anchor || anchor.role !== 'assistant') return;
   if (!isFinishedTurn(anchor)) return;
-  archive.set(anchorMessageId, balanceUsd);
+  archive.set(anchor.id, balanceUsd);
 }
 
 /**
